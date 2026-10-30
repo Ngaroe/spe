@@ -113,4 +113,159 @@ async function getCurrentBroadcast(ch) {
         const durationsMs = items.map(it => Number(it.duration_ms || (it.duration_s || it.duration || 0) * 1000));
         const totalDurationMs = durationsMs.reduce((a, b) => a + b, 0);
 
-        if (
+        if (totalDurationMs > 0) {
+            let posMs = ((nowMs - epochMs) % totalDurationMs + totalDurationMs) % totalDurationMs;
+            for (let i = 0; i < items.length; i++) {
+                const durMs = durationsMs[i];
+                if (posMs < durMs) {
+                    const currentItem = items[i];
+                    return {
+                        title: currentItem.title || currentItem.name || currentItem.video_id || ch.name,
+                        mp4Url: resolveArchiveUrl(currentItem),
+                        offsetSeconds: Math.floor(posMs / 1000)
+                    };
+                }
+                posMs -= durMs;
+            }
+        }
+    }
+    return null;
+}
+
+const manifest = {
+    id: "org.fisheatduck.spelunkrtv.live",
+    version: "5.1.0",
+    name: "Spelunkr Cable Network",
+    description: "Fully synchronized 24/7 live cable feed remuxed via FFmpeg",
+    resources: ["catalog", "meta", "stream"],
+    types: ["tv"],
+    idPrefixes: ["spelunkr_"],
+    catalogs: [{ type: "tv", id: "spelunkr_dial", name: "Spelunkr TV Guide (Live)" }]
+};
+
+const builder = new addonBuilder(manifest);
+
+async function buildChannelMeta(ch) {
+    const live = await getCurrentBroadcast(ch);
+    const nowPlayingLine = live ? `🟢 ON NOW: ${live.title}\n\n` : "";
+    const posterText = encodeURIComponent(`CH ${ch.num}\n${ch.name.split("·")[1] ? ch.name.split("·")[1].trim() : ch.slug}`);
+
+    return {
+        id: `spelunkr_${ch.slug}`,
+        type: "tv",
+        name: ch.name,
+        genres: [ch.genre],
+        description: `${nowPlayingLine}${ch.desc}`,
+        poster: `https://placehold.co/600x600/0d0d0d/00ff66/png?text=${posterText}`,
+        background: `https://placehold.co/1280x720/080808/00ff66/png?text=${posterText}`,
+        posterShape: "square"
+    };
+}
+
+builder.defineCatalogHandler(async ({ type, id }) => {
+    if (type !== "tv" || id !== "spelunkr_dial") return { metas: [] };
+    const channels = await getDynamicChannels();
+    const metas = await Promise.all(channels.map(ch => buildChannelMeta(ch)));
+    return { metas, cacheMaxAge: 60 };
+});
+
+builder.defineMetaHandler(async ({ type, id }) => {
+    const slug = id.replace("spelunkr_", "");
+    const channels = await getDynamicChannels();
+    const ch = channels.find(c => c.slug === slug || c.num === slug);
+    if (!ch) return { meta: null };
+    const meta = await buildChannelMeta(ch);
+    return { meta, cacheMaxAge: 30 };
+});
+
+builder.defineStreamHandler(async ({ type, id }) => {
+    const slug = id.replace("spelunkr_", "");
+    const channels = await getDynamicChannels();
+    const ch = channels.find(c => c.slug === slug || c.num === slug);
+    if (!ch) return { streams: [] };
+
+    const live = await getCurrentBroadcast(ch);
+    const streams = [
+        {
+            name: `📺 CH ${ch.num} LIVE`,
+            title: live ? `Live Broadcast: ${live.title}` : `Tune In Live: ${ch.name}`,
+            url: `${PUBLIC_HOST}/live/${ch.slug}.ts`,
+            behaviorHints: { notWebReady: true }
+        }
+    ];
+
+    if (live && live.mp4Url) {
+        streams.push({
+            name: `📼 Rewind Tape`,
+            title: `Play Current Tape From 00:00: ${live.title}`,
+            url: live.mp4Url
+        });
+    }
+
+    return { streams, cacheMaxAge: 15 };
+});
+
+const app = express();
+app.use(getRouter(builder.getInterface()));
+
+app.get("/live/:channelSlug.ts", async (req, res) => {
+    const channels = await getDynamicChannels();
+    const ch = channels.find(c => c.slug === req.params.channelSlug || c.num === req.params.channelSlug);
+    if (!ch) return res.status(404).send("Channel not found");
+
+    res.setHeader("Content-Type", "video/mp2t");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+
+    let clientDisconnected = false;
+    let activeFfmpeg = null;
+
+    const cleanup = () => {
+        clientDisconnected = true;
+        if (activeFfmpeg && !activeFfmpeg.killed) {
+            activeFfmpeg.kill("SIGKILL");
+        }
+    };
+
+    req.on("close", cleanup);
+    res.on("close", cleanup);
+
+    while (!clientDisconnected) {
+        const live = await getCurrentBroadcast(ch);
+        if (!live || !live.mp4Url) {
+            res.status(503).end("Could not resolve broadcast stream.");
+            break;
+        }
+
+        await new Promise((resolve) => {
+            const ffmpegArgs = [
+                "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5",
+                "-ss", String(live.offsetSeconds),
+                "-re",
+                "-i", live.mp4Url,
+                "-c", "copy",
+                "-bsf:v", "h264_mp4toannexb",
+                "-f", "mpegts",
+                "-mpegts_copyts", "1",
+                "pipe:1"
+            ];
+
+            activeFfmpeg = spawn("ffmpeg", ffmpegArgs, { stdio: ["ignore", "pipe", "ignore"] });
+            activeFfmpeg.stdout.pipe(res, { end: false });
+
+            activeFfmpeg.on("close", () => resolve());
+            activeFfmpeg.on("error", () => resolve());
+        });
+
+        if (!clientDisconnected) {
+            await new Promise(r => setTimeout(r, 500));
+        }
+    }
+});
+
+app.listen(PORT, () => {
+    console.log(`Spelunkr Live Addon running at ${PUBLIC_HOST}/manifest.json`);
+});
